@@ -1,0 +1,115 @@
+name: Build Unsigned iOS IPA
+
+# Runs on GitHub's free macOS runners. Produces an UNSIGNED .ipa (no
+# Apple Developer account needed at all) which you then sign+install
+# yourself using Sideloadly on your PC with a free Apple ID.
+#
+# Key fix: do NOT override CONFIGURATION_BUILD_DIR. CocoaPods generates
+# cross-target module map references at `pod install` time pointing at
+# Xcode's DEFAULT build products location under derivedDataPath -- if
+# you redirect where files get written via CONFIGURATION_BUILD_DIR,
+# those references break (dependent pods can't find each other's
+# modulemaps), because they were baked in expecting the standard path.
+# Just let -derivedDataPath control the top-level location and use the
+# standard Build/Products/<config>-iphoneos subpath under it.
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+jobs:
+  build-unsigned-ipa:
+    runs-on: macos-latest
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install dependencies
+        run: npm install --legacy-peer-deps
+
+      - name: Prebuild native iOS project
+        run: npx expo prebuild --platform ios --clean
+
+      - name: Install CocoaPods dependencies
+        working-directory: ios
+        run: pod install
+
+      - name: Build app with ad-hoc signing
+        working-directory: ios
+        run: |
+          WORKSPACE=$(ls -d *.xcworkspace | head -n 1)
+          # Deriving the scheme from the app's own .xcodeproj name rather
+          # than parsing `xcodebuild -workspace ... -list`, which returns
+          # EVERY scheme in the whole workspace (including every
+          # CocoaPods dependency's own scheme) -- that's what caused
+          # earlier runs to accidentally build a random Pod library
+          # (e.g. "AsyncStorage") instead of the actual app.
+          SCHEME=$(ls -d *.xcodeproj | head -n 1 | sed 's/\.xcodeproj$//')
+          echo "Using workspace: $WORKSPACE"
+          echo "Using scheme: $SCHEME"
+
+          # Ad-hoc signing ("-") needs no Apple account at all -- it's a
+          # free, built-in codesign mode. Unlike fully disabling signing
+          # (which Apple's own DTS engineers say isn't really supported
+          # for command-line iOS builds), ad-hoc signing lets every
+          # normal build step complete, producing a real .app. Sideloadly
+          # replaces this throwaway signature with your actual free
+          # Apple ID anyway -- deliberately NOT overriding
+          # CONFIGURATION_BUILD_DIR here, see note above.
+          xcodebuild build \
+            -workspace "$WORKSPACE" \
+            -scheme "$SCHEME" \
+            -configuration Release \
+            -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath build/DerivedData \
+            CODE_SIGN_IDENTITY="-" \
+            CODE_SIGNING_REQUIRED=YES \
+            CODE_SIGNING_ALLOWED=YES \
+            AD_HOC_CODE_SIGNING_ALLOWED=YES \
+            DEVELOPMENT_TEAM="" \
+            ONLY_ACTIVE_ARCH=NO
+
+      - name: Verify build output
+        working-directory: ios
+        run: |
+          echo "Contents of build/DerivedData/Build/Products:"
+          find build/DerivedData/Build/Products -maxdepth 2 2>/dev/null || echo "Products dir not found"
+          echo ""
+          echo "Looking for .app anywhere under DerivedData:"
+          find build/DerivedData -name "*.app" -maxdepth 6 2>/dev/null || echo "No .app found"
+
+      - name: Package unsigned IPA
+        working-directory: ios
+        run: |
+          mkdir -p build/Payload
+          APP_PATH=$(find build/DerivedData/Build/Products -maxdepth 2 -name "*.app" 2>/dev/null | head -n 1)
+          if [ -z "$APP_PATH" ]; then
+            echo "Not in the expected Products folder -- searching all of DerivedData..."
+            APP_PATH=$(find build/DerivedData -name "*.app" -maxdepth 6 2>/dev/null | head -n 1)
+          fi
+          if [ -z "$APP_PATH" ]; then
+            echo "::error::Still no .app found -- see the 'Verify build output' step above for what's actually there."
+            exit 1
+          fi
+          echo "Found app at: $APP_PATH"
+          cp -r "$APP_PATH" build/Payload/
+          cd build
+          zip -r ChillFinder-unsigned.ipa Payload
+          cd ..
+          mkdir -p ../output
+          cp build/ChillFinder-unsigned.ipa ../output/
+
+      - name: Upload IPA artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ChillFinder-unsigned-ipa
+          path: output/ChillFinder-unsigned.ipa
+          retention-days: 14
